@@ -1,89 +1,93 @@
-use core::fmt;
-use std::io::{Error, Read, Write};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Error, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread::spawn;
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread::{self};
 
-enum Message {
-    ClientConnected(TcpStream),
-    ClientDisconnec(TcpStream),
-    ChatMessage([u8; 512]),
+struct Session {
+    peers: HashMap<String, Sender<String>>,
 }
 
-impl fmt::Display for Message {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ChatMessage(msg) => write!(f, "[Message]: {}", String::from_utf8_lossy(msg)),
-            Self::ClientConnected(stream) => write!(f, "[Connected] {:#?}", stream),
-            Self::ClientDisconnec(stream) => write!(f, "[Disconnected] {:#?}", stream),
-        }
-    }
-}
-
-struct Server {
-    clients: Vec<TcpStream>,
-}
-
-impl Server {
+impl Session {
     fn make() -> Self {
-        Self { clients: vec![] }
+        let session = Session {
+            peers: HashMap::new(),
+        };
+        session
     }
-    fn main_loop(&mut self, recv: Receiver<Message>) {
-        for msg in recv {
-            match msg {
-                Message::ClientConnected(stream) => self.handle_connected(stream),
-                Message::ClientDisconnec(stream) => self.handle_disconnec(stream),
-                Message::ChatMessage(msg) => self.handle_chat_message(msg),
+
+    fn broadcast(&self, msg: &str) {
+        for (name, chan) in &self.peers {
+            if let Err(err) = chan.send(msg.to_string()) {
+                eprintln!("[Error]: Couldn't broadcast to {}: {:?}", name, err);
             }
         }
-    }
-
-    fn handle_connected(&mut self, stream: TcpStream) {
-        self.clients.push(stream);
-    }
-
-    fn handle_disconnec(&mut self, stream: TcpStream) {
-        self.clients
-            .retain(|s| s.peer_addr().unwrap() != stream.peer_addr().unwrap());
-    }
-
-    fn handle_chat_message(&mut self, msg: [u8; 512]) {
-        self.clients.iter().for_each(|mut s| {
-            s.write(&msg).unwrap();
-        })
     }
 }
 
-fn client(stream: TcpStream, senr: Sender<Message>) {
-    let mut stream1 = match stream.try_clone() {
-        Ok(stream1) => stream1,
-        Err(err) => {
-            eprintln!("[Error]: Couldn't clone client's stream: {:?}", err);
-            return;
-        }
-    };
+struct Client {
+    name: String,
+    stream: TcpStream,
+    session: Arc<Mutex<Session>>,
+}
 
-    if let Err(err) = senr.send(Message::ClientConnected(stream)) {
-        eprintln!("[Error]: Couldn't send connection event: {:?}", err);
-        return;
+impl Client {
+    fn make(stream: TcpStream, session: Arc<Mutex<Session>>) -> Self {
+        let client = Client {
+            name: String::new(),
+            stream,
+            session,
+        };
+
+        client
     }
 
-    let mut buffer: [u8; 512] = [0; 512];
-    loop {
-        match stream1.read(&mut buffer) {
-            Ok(0) => {
-                senr.send(Message::ClientDisconnec(stream1)).unwrap();
-                break;
-            }
-            Ok(_) => {
-                senr.send(Message::ChatMessage(buffer)).unwrap();
-                buffer = [0; 512];
-            }
-            Err(err) => {
-                eprintln!("[Error]: Couldn't read from client: {:?}", err);
-                break;
-            }
+    fn main_loop(&mut self) -> std::io::Result<()> {
+        self.ask_name()?;
+
+        let (tx, rx) = mpsc::channel();
+
+        // Notify everbody that a new client has joined!
+        {
+            println!("[INFO]: {} is connected", &self.name);
+            let mut session = self.session.lock().unwrap();
+            session.peers.insert(self.name.clone(), tx);
+            session.broadcast(&format!("[{}] is ONLINE", &self.name));
         }
+
+        let mut reader = BufReader::new(self.stream.try_clone()?);
+        let session_clone = self.session.clone();
+        let name_cloned = self.name.clone();
+
+        thread::spawn(move || {
+            let mut buf = String::new();
+            while reader.read_line(&mut buf).unwrap() > 0 {
+                let msg = format!("[{}] {}", name_cloned, buf.trim());
+                {
+                    let session = session_clone.lock().unwrap();
+                    session.broadcast(&msg);
+                }
+                buf.clear();
+            }
+        });
+
+        let mut writer = self.stream.try_clone()?;
+        for msg in rx {
+            writeln!(writer, "{}", msg)?;
+            writer.flush()?;
+        }
+
+        Ok(())
+    }
+
+    fn ask_name(&mut self) -> std::io::Result<()> {
+        let mut reader = BufReader::new(self.stream.try_clone()?);
+        writeln!(self.stream, "Please enter your username:")?;
+        let mut buf = String::new();
+        reader.read_line(&mut buf)?;
+        self.name = buf.trim().to_string();
+        Ok(())
     }
 }
 
@@ -92,13 +96,9 @@ fn main() -> Result<(), Error> {
     let address = SocketAddr::new(ipv4, 8080);
     let listener = TcpListener::bind(address)?;
 
-    let mut server = Server::make();
+    let session = Arc::new(Mutex::new(Session::make()));
 
-    let (sndr, recv) = mpsc::channel::<Message>();
-
-    spawn(move || {
-        server.main_loop(recv);
-    });
+    println!("Listening for incoming connection on port 8080...");
 
     for stream in listener.incoming() {
         if let Err(err) = stream {
@@ -106,10 +106,11 @@ fn main() -> Result<(), Error> {
             continue;
         }
 
-        let sndr = mpsc::Sender::clone(&sndr);
-
-        spawn(move || {
-            client(stream.unwrap(), sndr);
+        let session = session.clone();
+        thread::spawn(move || {
+            if let Err(err) = Client::make(stream.unwrap(), session).main_loop() {
+                eprintln!("[Error]: {:?}", err);
+            }
         });
     }
 
